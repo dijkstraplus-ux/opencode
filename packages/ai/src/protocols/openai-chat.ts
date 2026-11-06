@@ -383,6 +383,8 @@ export interface ParserState {
 interface LoweringOptions {
   readonly cacheControl?: (cache: CacheHint | undefined) => OpenAIChatCacheControl | undefined
   readonly toolCallID?: (id: string) => string
+  /** Send tool output as a text part instead of a bare string. */
+  readonly toolResultParts?: boolean
   /** Project provider-specific fields from the exact source, even when other messages are dropped during lowering. */
   readonly assistant?: (source: AssistantMessage, message: OpenAIChatMessage) => OpenAIChatMessage
 }
@@ -585,6 +587,7 @@ const lowerToolMessages = Effect.fnUntraced(function* (message: ToolMessage, opt
           options.toolCallID?.(part.id) ?? part.id,
           ProviderShared.toolResultText(part),
           options.cacheControl?.(part.cache),
+          options.toolResultParts,
         ),
       )
       continue
@@ -592,7 +595,12 @@ const lowerToolMessages = Effect.fnUntraced(function* (message: ToolMessage, opt
     const content: ReadonlyArray<Tool.Content> = part.result.value
     const text = content.filter((item) => item.type === "text").map((item) => item.text)
     messages.push(
-      toolMessage(options.toolCallID?.(part.id) ?? part.id, text.join("\n"), options.cacheControl?.(part.cache)),
+      toolMessage(
+        options.toolCallID?.(part.id) ?? part.id,
+        text.join("\n"),
+        options.cacheControl?.(part.cache),
+        options.toolResultParts,
+      ),
     )
     const files = content.filter((item) => item.type === "file")
     attachments.push(...(yield* Effect.forEach(files, (item) => lowerMedia(ProviderShared.toolFileMedia(item)))))
@@ -601,10 +609,20 @@ const lowerToolMessages = Effect.fnUntraced(function* (message: ToolMessage, opt
 })
 
 // Chat cache breakpoints belong on text content parts, not on the message itself.
-const toolMessage = (toolCallID: string, text: string, cacheControl: OpenAIChatCacheControl | undefined) => ({
+const toolMessage = (
+  toolCallID: string,
+  text: string,
+  cacheControl: OpenAIChatCacheControl | undefined,
+  parts = false,
+) => ({
   role: "tool" as const,
   tool_call_id: toolCallID,
-  content: cacheControl === undefined ? text : [{ type: "text" as const, text, cache_control: cacheControl }],
+  content:
+    cacheControl !== undefined
+      ? [{ type: "text" as const, text, cache_control: cacheControl }]
+      : parts
+        ? [{ type: "text" as const, text }]
+        : text,
 })
 
 const lowerMessage = Effect.fnUntraced(function* (
@@ -647,8 +665,15 @@ const lowerMessages = Effect.fnUntraced(function* (
       modelID.includes("deepseek"))
   const reasoningField = request.model.compatibility?.reasoningField
   const mistral = ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
+  // Cohere reads a string tool result holding a JSON object as a document whose `id` must be a string, so a numeric
+  // `id` in the output (e.g. `gh api user`) rejects every later request. Gateways forward Cohere models as `cohere/…`.
+  const cohere =
+    request.model.provider === "cohere" ||
+    request.model.route.endpoint.baseURL?.toLowerCase().includes("cohere.") ||
+    modelID.startsWith("cohere/")
   const lowering = {
     ...options,
+    toolResultParts: options.toolResultParts ?? cohere,
     providerMetadataKey: request.model.route.providerMetadataKey ?? request.model.provider,
     toolCallID: (id: string) => {
       if (mistral)

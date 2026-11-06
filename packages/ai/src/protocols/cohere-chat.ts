@@ -168,7 +168,10 @@ const fromRequest = Effect.fn("CohereChat.fromRequest")(function* (request: LLMR
           return yield* ProviderShared.unsupportedContent("Cohere Chat", "tool", ["tool-result"])
         if (part.result.type === "content" && part.result.value.some((item) => item.type === "file"))
           return yield* ProviderShared.invalidRequest("Cohere Chat does not support file content in tool results")
-        messages.push({ role: "tool", tool_call_id: part.id, content: ProviderShared.toolResultText(part) })
+        // A string tool result holding a JSON object is read as a document whose `id` must be a string, so a
+        // numeric `id` in the output (e.g. `gh api user`) rejects every later request. A text block stays text.
+        const text = ProviderShared.toolResultText(part)
+        messages.push({ role: "tool", tool_call_id: part.id, content: [{ type: "text", text }] })
       }
       continue
     }

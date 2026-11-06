@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import { Effect } from "effect"
 import { ai, isRetryable, LLMClient, LLMEvent, Media, Message, SystemPart } from "../../src/effect.js"
 import { Cohere } from "../../src/providers/cohere.js"
+import { OpenAICompatible } from "../../src/providers/openai-compatible.js"
 import { compileRequest } from "../../src/route/client.js"
 import { it } from "../lib/effect.js"
 import { fixedResponse } from "../lib/http.js"
@@ -58,8 +59,64 @@ it.effect("Cohere lowers native history, thinking, tools, and sampling", () =>
           role: "assistant",
           tool_calls: [{ id: "lookup-1", function: { name: "lookup", arguments: '{"city":"Paris"}' } }],
         },
-        { role: "tool", tool_call_id: "lookup-1", content: '{"sunny":true}' },
+        { role: "tool", tool_call_id: "lookup-1", content: [{ type: "text", text: '{"sunny":true}' }] },
       ],
+    })
+  }),
+)
+
+// Cohere reads a bare string tool result that holds a JSON object as a document, and rejects the whole request when
+// that object's `id` is not a string ("A tool result's output's id field must be a string"), e.g. `gh api user`.
+it.effect("Cohere sends JSON tool output as text so a numeric id is not read as a document id", () =>
+  Effect.gen(function* () {
+    const output = '{"login":"octocat","id":583231}'
+    const history = [
+      Message.user("run gh api user"),
+      Message.assistant([{ type: "tool-call", id: "bash-1", name: "bash", input: { command: "gh api user" } }]),
+      Message.tool({ id: "bash-1", name: "bash", result: { type: "text", value: output } }),
+      Message.tool({ id: "bash-2", name: "bash", result: { login: "octocat", id: 583231 } }),
+    ]
+    const tools = [{ name: "bash", description: "Run a command", inputSchema: { type: "object", properties: {} } }]
+    const kilo = OpenAICompatible.configure({
+      provider: "kilo",
+      baseURL: "https://api.kilo.ai/api/gateway",
+      apiKey: "fixture",
+    })
+    for (const model of [
+      cohere.model("command-a-03-2025"),
+      cohere.chat("north-mini-code-1-0"),
+      kilo.model("cohere/north-mini-code:free"),
+    ]) {
+      const prepared = yield* compileRequest(ai.request({ model, messages: history, tools }))
+      expect(prepared.body.messages.filter((message: { role: string }) => message.role === "tool")).toEqual([
+        { role: "tool", tool_call_id: "bash-1", content: [{ type: "text", text: output }] },
+        { role: "tool", tool_call_id: "bash-2", content: [{ type: "text", text: output }] },
+      ])
+    }
+  }),
+)
+
+it.effect("Other compatible providers keep tool output as a plain string", () =>
+  Effect.gen(function* () {
+    const model = OpenAICompatible.configure({
+      provider: "kilo",
+      baseURL: "https://api.kilo.ai/api/gateway",
+      apiKey: "fixture",
+    }).model("nvidia/nemotron-nano-9b-v2:free")
+    const prepared = yield* compileRequest(
+      ai.request({
+        model,
+        messages: [
+          Message.user("run gh api user"),
+          Message.assistant([{ type: "tool-call", id: "bash-1", name: "bash", input: { command: "gh api user" } }]),
+          Message.tool({ id: "bash-1", name: "bash", result: { login: "octocat", id: 583231 } }),
+        ],
+      }),
+    )
+    expect(prepared.body.messages.at(-1)).toEqual({
+      role: "tool",
+      tool_call_id: "bash-1",
+      content: '{"login":"octocat","id":583231}',
     })
   }),
 )

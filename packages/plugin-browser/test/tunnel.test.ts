@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { createServer, type Socket } from "node:net"
+import { connect, createServer, type Socket } from "node:net"
 import { request } from "node:http"
 import { once } from "node:events"
 import { Effect, Fiber } from "effect"
@@ -164,5 +164,70 @@ test("HTTP proxy requires local credentials and resolves targets only through it
     await proxy.close()
     tunnel.dispose()
     target.stop(true)
+  }
+}, 15_000)
+
+test("HTTP proxy reports why the server could not open a tunnel", async () => {
+  // A port that refuses, as a LAN host the server cannot reach would.
+  const closed = createServer()
+  await once(closed.listen(0, "127.0.0.1"), "listening")
+  const address = closed.address()
+  if (!address || typeof address === "string") throw new Error("No TCP address")
+  await new Promise<void>((resolve) => closed.close(() => resolve()))
+  const tunnel = BrowserTunnel.make()
+  const proxy = await BrowserProxy.make({
+    // The RPC client rejects with the server's `{ type, message }` failure, not an Error.
+    open: (destination, signal) =>
+      Effect.runPromise(
+        tunnel
+          .open({ ...destination, host: "127.0.0.1", port: address.port })
+          .pipe(Effect.mapError((error) => ({ type: "unavailable", message: error.message }))),
+        { signal },
+      ),
+    read: (id, signal) => Effect.runPromise(tunnel.read(id), { signal }),
+    write: (id, data, end, signal) => Effect.runPromise(tunnel.write(id, data, end), { signal }),
+    close: (id) => Effect.runPromise(tunnel.close(id)),
+  })
+  const authorization = `Basic ${Buffer.from(`${proxy.credentials.username}:${proxy.credentials.password}`).toString("base64")}`
+  const reason = `ECONNREFUSED 127.0.0.1:${address.port}`
+  try {
+    const forwarded = await new Promise<{ status?: number; body: string }>((resolve, reject) => {
+      const req = request(
+        {
+          hostname: proxy.host,
+          port: proxy.port,
+          path: "http://192.168.49.78/",
+          headers: { "Proxy-Authorization": authorization },
+        },
+        (response) => {
+          let body = ""
+          response.on("data", (chunk) => {
+            body += chunk
+          })
+          response.on("end", () => resolve({ status: response.statusCode, body }))
+        },
+      )
+      req.on("error", reject)
+      req.end()
+    })
+    expect(forwarded.status).toBe(502)
+    expect(forwarded.body).toContain(reason)
+
+    const socket = connect(proxy.port, proxy.host)
+    socket.end(
+      `CONNECT 192.168.49.78:443 HTTP/1.1\r\nHost: 192.168.49.78:443\r\nProxy-Authorization: ${authorization}\r\n\r\n`,
+    )
+    let raw = ""
+    socket.on("data", (chunk) => {
+      raw += chunk
+    })
+    await once(socket, "close")
+    expect(raw).toStartWith("HTTP/1.1 502 Bad Gateway\r\n")
+    const [head = "", body = ""] = raw.split("\r\n\r\n")
+    expect(body).toContain(reason)
+    expect(head).toContain(`Content-Length: ${Buffer.byteLength(body)}`)
+  } finally {
+    await proxy.close()
+    tunnel.dispose()
   }
 }, 15_000)

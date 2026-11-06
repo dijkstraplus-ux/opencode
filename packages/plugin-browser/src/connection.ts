@@ -180,6 +180,14 @@ export const make = Effect.fn("BrowserConnection.make")(function* (
       "tunnel.open": (input, call) =>
         tunnels(input).pipe(
           Effect.flatMap((network) => network.open(input.target)),
+          // The HTTP log records only the 400; keep the reason, such as `connect EHOSTUNREACH`, beside it.
+          Effect.tapError((error) =>
+            Effect.logWarning("Browser tunnel open failed", {
+              host: input.target.host,
+              port: input.target.port,
+              error: error.message,
+            }),
+          ),
           Effect.mapError((error) => call.error("unavailable", error.message, {})),
         ),
       "tunnel.read": (input, call) =>

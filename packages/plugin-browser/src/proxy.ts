@@ -60,10 +60,11 @@ export async function make(transport: Transport) {
     }
   }
   const server = createServer({ maxHeaderSize: 64 * 1024 }, (incoming, response) => {
-    void forward(incoming, response, connect, authorized).catch(() => {
+    void forward(incoming, response, connect, authorized).catch((error: unknown) => {
       if (!response.headersSent) {
-        response.writeHead(502)
-        response.end()
+        const body = failure(error)
+        response.writeHead(502, { "content-type": "text/plain; charset=utf-8", "content-length": body.byteLength })
+        response.end(body)
         return
       }
       response.destroy()
@@ -132,9 +133,18 @@ export async function make(transport: Transport) {
       } finally {
         socket.off("close", cancel)
       }
-    })().catch(() => {
+    })().catch((error: unknown) => {
       opened?.destroy()
-      if (!socket.destroyed) socket.end("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      if (socket.destroyed) return
+      const body = failure(error)
+      socket.end(
+        Buffer.concat([
+          Buffer.from(
+            `HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.byteLength}\r\nConnection: close\r\n\r\n`,
+          ),
+          body,
+        ]),
+      )
     })
   }
   server.on("connect", (incoming, socket, head) => upgrade(incoming, socket, head, true))
@@ -344,5 +354,18 @@ class TunnelSocket extends Duplex {
 }
 
 function asError(error: unknown) {
-  return error instanceof Error ? error : new Error(String(error))
+  if (error instanceof Error) return error
+  // RPC calls reject with the server's `{ type, message }` failure, not an Error.
+  if (typeof error === "object" && error !== null && "message" in error && typeof error.message === "string")
+    return new Error(error.message, { cause: error })
+  return new Error(String(error))
+}
+
+/**
+ * The 502 body for a request the proxy could not serve. Chromium shows only ERR_TUNNEL_CONNECTION_FAILED for a refused
+ * CONNECT, but renders a plain request's body; the reason, such as `connect EHOSTUNREACH`, tells a server that cannot
+ * reach the address apart from a site that answered 502 itself.
+ */
+function failure(error: unknown) {
+  return Buffer.from(`OpenCode browser proxy: ${asError(error).message}\n`)
 }
